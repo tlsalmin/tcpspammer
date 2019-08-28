@@ -59,6 +59,21 @@ Needs just pthread and \_GNU\_SOURCE e.g.
 clang -D_GNU_SOURCE -Wall -Wextra -O3 -lpthread -std=c11 ./tcpspammer.c -o tcpspammer
 ```
 
+## Test setups.
+
+To get the most out of this tool it's recommended to dramatically increase the
+OS fd limits. This means two files sysctl variables. Here they're increased to
+~40 million:
+
+```
+sysctl -w fs.file-max=39253532
+sysctl -w fs.nr_open=39253532
+sysctl -p
+```
+
+When starting tcpspammer, use the -M switch (not -m) to increase the open file
+count to the minimum of the two sysctl parameters.
+
 ## Internals
 
 tcpspammer employes epoll, timer, signal, pipe and event file descriptors. Heap

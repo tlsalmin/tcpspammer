@@ -25,6 +25,8 @@
 
 int logpipe[2];
 static int verbosity = 0;
+static unsigned int keepidle_value = 5;
+static unsigned int max_conns_per_loop = 8192;
 
 static void log_func(int lvl, const char *func, unsigned int line,
                     const char *fmt, ...)__attribute__((format(printf, 4, 5)));
@@ -75,6 +77,7 @@ struct tcpspammer_thread_ctx
   int cpu;         //!< Cpu this thread is running on.
   _Atomic uint64_t active_connections;      //!< Connections started.
   _Atomic uint64_t established_connections; //!< Connections handshaked.
+  _Atomic uint64_t new_connections;         //!< New connections this second.
   pthread_t thread;
   pthread_attr_t attr;
   struct tcpspammer_ctx *main_ctx;
@@ -98,6 +101,8 @@ struct tcpspammer_ctx
   unsigned int n_connections;            //!< Number of connections per thread.
   _Atomic short n_finished;              //!< Number of threads finished.
   bool listen; //!< True if process listens rather than connects.
+  bool disconnect_after_hello; //!< True if connection is closed after reply.
+  bool explicit_echo; //!< Echo timer explicitly set.
 };
 
 __thread char ipstr_src[INET6_ADDRSTRLEN];
@@ -490,9 +495,14 @@ static bool so_timeout(int fd)
 {
   int yes = 1;
 
+  if (!keepidle_value)
+    {
+      return true;
+    }
+
   if (!setsockopt(fd, SOL_SOCKET, SO_KEEPALIVE, &yes, sizeof(yes)))
     {
-      int keepcount = 2, idle = 5, between = 5;
+      int keepcount = 2, idle = keepidle_value, between = keepidle_value;
 
       if (!setsockopt(fd, IPPROTO_TCP, TCP_KEEPCNT, &keepcount, sizeof(int)) &&
           !setsockopt(fd, IPPROTO_TCP, TCP_KEEPIDLE, &idle, sizeof(int)) &&
@@ -526,12 +536,14 @@ static bool do_sockopts(int fd, int cpu, enum available_sockopts opts)
 {
   bool bret = true;
   int yes = 1;
+  static _Atomic uint32_t incoming_cpu_failed = 0;
 
-  if (opts & SOCKOPT_INCOMING_CPU &&
+  if (!incoming_cpu_failed && opts & SOCKOPT_INCOMING_CPU &&
       setsockopt(fd, SOL_SOCKET, SO_INCOMING_CPU, &cpu, sizeof(cpu)))
     {
       FATAL("Failed to balance %d to cpu %d: %m", fd, cpu);
-      bret = false;
+      incoming_cpu_failed = 1;
+      // Don't fail fully, just warn once. User might just have old kernel.
     }
   if (opts & SOCKOPT_REUSEADDR &&
       setsockopt(fd, SOL_SOCKET, SO_REUSEADDR, &yes, sizeof(yes)))
@@ -649,19 +661,20 @@ static bool thread_connect(struct tcpspammer_thread_ctx *ctx)
 
                   if (!epoll_ctl(efd, EPOLL_CTL_ADD, fd, &ev))
                     {
-                          ctx->active_connections++;
-                          if (!ret)
-                            {
-                              ctx->established_connections++;
-                            }
+                      ctx->active_connections++;
+                      if (!ret)
+                        {
+                          ctx->established_connections++;
+                          ctx->new_connections++;
+                        }
 
-                          strings_set(src, false, 2);
-                          strings_set(dst, true, 2);
-                          DBG("Connect%s from %s:%s to %s:%s", (ret) ? "ing" :
-                              "ed", ipstr_src, service_str_dst,
-                              ipstr_dst, service_str_dst);
+                      strings_set(src, false, 2);
+                      strings_set(dst, true, 2);
+                      DBG("Connect%s from %s:%s to %s:%s", (ret) ? "ing" : "ed",
+                          ipstr_src, service_str_dst, ipstr_dst,
+                          service_str_dst);
 
-                          return true;
+                      return true;
                     }
                   else
                     {
@@ -754,16 +767,21 @@ static bool thread_connections(void *ctx_ptr,
         }
       else
         {
-          struct epoll_event ev_echo =
+          if (ctx->main_ctx->disconnect_after_hello)
             {
-              .data.fd = fd,
-              .events = EPOLLOUT | EPOLLONESHOT
-            };
-
-          if (epoll_ctl(ctx->efd_echo, EPOLL_CTL_MOD, fd, &ev_echo))
-            {
-              ERR("Failed to add %d back to echo list: %m", fd);
+              INF("Disconnecting after received reply");
               safe_close_decrement(&fd, ctx->efd_connect, ctx, true);
+            }
+          else if (ctx->main_ctx->explicit_echo)
+            {
+              struct epoll_event ev_echo = {.data.fd = fd,
+                                            .events = EPOLLOUT | EPOLLONESHOT};
+
+              if (epoll_ctl(ctx->efd_echo, EPOLL_CTL_MOD, fd, &ev_echo))
+                {
+                  ERR("Failed to add %d back to echo list: %m", fd);
+                  safe_close_decrement(&fd, ctx->efd_connect, ctx, true);
+                }
             }
         }
     }
@@ -805,6 +823,7 @@ static bool handle_listening(void *ctx_ptr,
             {
               ctx->active_connections++;
               ctx->established_connections++;
+              ctx->new_connections++;
               continue;
             }
           else
@@ -827,6 +846,24 @@ static bool handle_listening(void *ctx_ptr,
           ERR("Failed to accept on fd %d: %m", fd);
           return false;
         }
+    }
+  return true;
+}
+
+static bool send_hello(void *ctx_ptr, struct epoll_event *ev)
+{
+  struct tcpspammer_thread_ctx *ctx = ctx_ptr;
+  ssize_t ret;
+  int fd = ev->data.fd;
+
+  ret = write(fd, ctx->main_ctx->echostring, strlen(ctx->main_ctx->echostring));
+  if (ret <= 0)
+    {
+      ERR("Failed to write to %d: %s", fd, (!ret) ? "Disconnected" :
+          strerror(errno));
+      safe_close_decrement(
+        &fd, (ctx->main_ctx->explicit_echo) ? ctx->efd_echo : ctx->efd_connect,
+        ctx, true);
     }
   return true;
 }
@@ -861,6 +898,7 @@ static bool handle_einprogress(void *ctx_ptr,
                             .data.fd = fd, .events = EPOLLOUT | EPOLLONESHOT};
 
                           if (!ctx->main_ctx->echostring ||
+                              ctx->main_ctx->disconnect_after_hello ||
                               !epoll_ctl(ctx->efd_echo, EPOLL_CTL_ADD, fd,
                                          &ev_echo))
                             {
@@ -871,6 +909,12 @@ static bool handle_einprogress(void *ctx_ptr,
                                       service_str_dst);
                                 }
                               ctx->established_connections++;
+                              ctx->new_connections++;
+                              if (ctx->main_ctx->echostring &&
+                                  ctx->main_ctx->disconnect_after_hello)
+                                {
+                                  send_hello(ctx_ptr, &ev_echo);
+                                }
                               return true;
                             }
                           else
@@ -949,22 +993,6 @@ static bool should_exit(int eventfd)
   return false;
 }
 
-static bool send_hello(void *ctx_ptr, struct epoll_event *ev)
-{
-  struct tcpspammer_thread_ctx *ctx = ctx_ptr;
-  ssize_t ret;
-  int fd = ev->data.fd;
-
-  ret = write(fd, ctx->main_ctx->echostring, strlen(ctx->main_ctx->echostring));
-  if (ret <= 0)
-    {
-      ERR("Failed to write to %d: %s", fd, (!ret) ? "Disconnected" :
-          strerror(errno));
-      safe_close_decrement(&fd, ctx->efd_echo, ctx, true);
-    }
-  return true;
-}
-
 static bool handle_thread_main_efd(void *ctx_ptr,
                                    struct epoll_event *ev)
 {
@@ -995,7 +1023,7 @@ static bool handle_thread_main_efd(void *ctx_ptr,
   else if (fd == ctx->timer)
     {
       continue_loop = (read_timer(ctx->timer) >= 0);
-      if (ctx->main_ctx->echostring)
+      if (ctx->main_ctx->echostring && ctx->efd_echo != -1)
         {
           while (epoll_handler(ctx->efd_echo, send_hello, ctx, 0) > 0)
             {
@@ -1037,7 +1065,7 @@ static void tcpspammer_thread_loop(struct tcpspammer_thread_ctx *ctx)
 
           DBG("Timeout. Asking for %u more connections", connections_missing);
 
-          for (i = 0; i < connections_missing; i++)
+          for (i = 0; i < connections_missing && i < max_conns_per_loop; i++)
             {
               if (!thread_connect(ctx))
                 {
@@ -1064,7 +1092,7 @@ static void *tcpspammer_thread_run(void *arg)
   ctx->efd_connect = epoll_create1(EPOLL_CLOEXEC);
   if (ctx->efd != -1 || ctx->efd_extra != -1 || ctx->efd_connect != -1)
     {
-      if (ctx->main_ctx->listen || !ctx->main_ctx->echostring ||
+      if (ctx->main_ctx->listen || !ctx->main_ctx->explicit_echo ||
           ((ctx->efd_echo = epoll_create1(EPOLL_CLOEXEC)) != -1))
         {
           if ((ctx->timer = init_timer(ctx->main_ctx->echo_timer)) != -1)
@@ -1227,7 +1255,7 @@ static bool handle_timer(struct tcpspammer_ctx *ctx)
 
   if (val > 0)
     {
-      uint64_t active = 0, established = 0;
+      uint64_t active = 0, established = 0, new_conns = 0;
       unsigned int i;
 
       DBG("Timer expired %d times", val);
@@ -1236,8 +1264,11 @@ static bool handle_timer(struct tcpspammer_ctx *ctx)
         {
           active += ctx->threads[i].active_connections;
           established += ctx->threads[i].established_connections;
+          new_conns += ctx->threads[i].new_connections;
+          ctx->threads[i].new_connections = 0;
         }
-      printf("Active: %lu, Established: %lu\n", active, established);
+      printf("Active: %lu, Established: %lu, New: %lu\n", active, established,
+             new_conns);
     }
   else
     {
@@ -1304,17 +1335,22 @@ static void usage(const char *bin)
           "Usage: %s [-lnspd]\n\n"
           "Options:\n"
           "          -l         Listens for connections\n"
-          "          -L <port>  Local port\n"
+          "          -L <port>  Local port. Defaults to 7 when listening.\n"
           "          -n <count> Specify connections per thread.\n"
           "          -m         Maximize fd soft limit.\n"
           "          -M         Maximize fds presuming CAP_SYS_RESOURCE .\n"
           "          -s <src>   Source for connections or listen IP\n"
+          "          -k <sec>   TCP keepidle and keepintvl value. Default 5\n"
+          "                     A value of 0 disables keepalive\n"
           "          -d <dst>   Destination for connections if not listening\n"
-          "          -p <port>  Destination port\n"
+          "          -i <count> Maximum number of connect-calls per loop.\n"
+          "                     Defaults to 8192.\n"
+          "          -p <port>  Destination port. Defaults to 7\n"
           "          -w         Reduce verbosity\n"
           "          -v         Increase verbosity\n\n"
           "          -a <str>   Echo string sent every second (or -e value)\n"
           "          -e <ms>    Interval for echo timer\n"
+          "          -E         Disconnect after receiving reply for hello\n"
           "The source and destinations can be a range. e.g.\n"
           "-s 10.0.0.1-10.0.0.100 which works also on IPv6. Note though that\n"
           "-s fd10::10-fd10::30 is not 20 addresses.",
@@ -1336,11 +1372,12 @@ int main(int argc, char **argv)
   struct tcpspammer_thread_ctx thread_ctxs[ctx.n_threads];
   const char *sources = NULL, *destinations = NULL, *service = NULL,
         *port = NULL;
+  const char *default_service = "7";
 
   ctx.threads = thread_ctxs;
   memset(thread_ctxs, 0, sizeof(thread_ctxs));
   srand(time(NULL));
-  while ((c = getopt(argc, argv, "ls:d:n:p:hvmMe:a:wL:")) != -1)
+  while ((c = getopt(argc, argv, "ls:d:n:p:hvmMe:a:wL:Ek:i:")) != -1)
     {
       switch(c)
         {
@@ -1384,12 +1421,22 @@ int main(int argc, char **argv)
               ctx.echo_timer.tv_sec = (val / 1000);
               ctx.echo_timer.tv_nsec = (val % 1000);
             }
+          ctx.explicit_echo = true;
+          break;
+        case 'E':
+          ctx.disconnect_after_hello = true;
           break;
         case 'v':
           verbosity++;
           break;
         case 'w':
           verbosity--;
+          break;
+        case 'k':
+          keepidle_value = atoi(optarg);
+          break;
+        case 'i':
+          max_conns_per_loop = atoi(optarg);
           break;
         default:
           ERR("Unknown arg %c", c);
@@ -1398,6 +1445,14 @@ int main(int argc, char **argv)
           usage(argv[0]);
           break;
         }
+    }
+  if (ctx.listen && !service)
+    {
+      service = default_service;
+    }
+  else if (!ctx.listen && !port)
+    {
+      port = default_service;
     }
 
   if (exit_val != EXIT_SUCCESS)
