@@ -11,6 +11,7 @@
 #include <fcntl.h>
 #include <stdbool.h>
 #include <pthread.h>
+#include <stdarg.h>
 #include <signal.h>
 #include <netdb.h>
 #include <errno.h>
@@ -77,7 +78,6 @@ struct tcpspammer_thread_ctx
   int cpu;         //!< Cpu this thread is running on.
   _Atomic uint64_t active_connections;      //!< Connections started.
   _Atomic uint64_t established_connections; //!< Connections handshaked.
-  _Atomic uint64_t new_connections;         //!< New connections this second.
   pthread_t thread;
   pthread_attr_t attr;
   struct tcpspammer_ctx *main_ctx;
@@ -99,7 +99,9 @@ struct tcpspammer_ctx
   unsigned int n_sources;                //!< Number of available sources.
   unsigned int n_destinations;           //!< Number of destinations.
   unsigned int n_connections;            //!< Number of connections per thread.
+  unsigned int n_connections_per_sec;    //!< Number of connections per second.
   _Atomic short n_finished;              //!< Number of threads finished.
+  _Atomic uint64_t new_connections;      //!< New connections this second.
   bool listen; //!< True if process listens rather than connects.
   bool disconnect_after_hello; //!< True if connection is closed after reply.
   bool explicit_echo; //!< Echo timer explicitly set.
@@ -665,7 +667,7 @@ static bool thread_connect(struct tcpspammer_thread_ctx *ctx)
                       if (!ret)
                         {
                           ctx->established_connections++;
-                          ctx->new_connections++;
+                          ctx->main_ctx->new_connections++;
                         }
 
                       strings_set(src, false, 2);
@@ -823,7 +825,7 @@ static bool handle_listening(void *ctx_ptr,
             {
               ctx->active_connections++;
               ctx->established_connections++;
-              ctx->new_connections++;
+              ctx->main_ctx->new_connections++;
               continue;
             }
           else
@@ -909,7 +911,7 @@ static bool handle_einprogress(void *ctx_ptr,
                                       service_str_dst);
                                 }
                               ctx->established_connections++;
-                              ctx->new_connections++;
+                              ctx->main_ctx->new_connections++;
                               if (ctx->main_ctx->echostring &&
                                   ctx->main_ctx->disconnect_after_hello)
                                 {
@@ -1065,7 +1067,11 @@ static void tcpspammer_thread_loop(struct tcpspammer_thread_ctx *ctx)
 
           DBG("Timeout. Asking for %u more connections", connections_missing);
 
-          for (i = 0; i < connections_missing && i < max_conns_per_loop; i++)
+          for (i = 0; i < connections_missing && i < max_conns_per_loop &&
+                      (!ctx->main_ctx->n_connections_per_sec ||
+                       ctx->main_ctx->new_connections <
+                         ctx->main_ctx->n_connections_per_sec);
+               i++)
             {
               if (!thread_connect(ctx))
                 {
@@ -1264,11 +1270,11 @@ static bool handle_timer(struct tcpspammer_ctx *ctx)
         {
           active += ctx->threads[i].active_connections;
           established += ctx->threads[i].established_connections;
-          new_conns += ctx->threads[i].new_connections;
-          ctx->threads[i].new_connections = 0;
         }
+      new_conns += ctx->new_connections;
       printf("Active: %lu, Established: %lu, New: %lu\n", active, established,
              new_conns);
+      ctx->new_connections = 0;
     }
   else
     {
@@ -1343,6 +1349,7 @@ static void usage(const char *bin)
           "          -k <sec>   TCP keepidle and keepintvl value. Default 5\n"
           "                     A value of 0 disables keepalive\n"
           "          -d <dst>   Destination for connections if not listening\n"
+          "          -N <count> Establish a maximum of count connections per second\n"
           "          -i <count> Maximum number of connect-calls per loop.\n"
           "                     Defaults to 8192.\n"
           "          -p <port>  Destination port. Defaults to 7\n"
@@ -1377,7 +1384,7 @@ int main(int argc, char **argv)
   ctx.threads = thread_ctxs;
   memset(thread_ctxs, 0, sizeof(thread_ctxs));
   srand(time(NULL));
-  while ((c = getopt(argc, argv, "ls:d:n:p:hvmMe:a:wL:Ek:i:")) != -1)
+  while ((c = getopt(argc, argv, "ls:d:n:p:hvmMe:a:wL:Ek:i:N:")) != -1)
     {
       switch(c)
         {
@@ -1413,6 +1420,9 @@ int main(int argc, char **argv)
           break;
         case 'a':
           ctx.echostring = optarg;
+          break;
+        case 'N':
+          ctx.n_connections_per_sec = atoi(optarg);
           break;
         case 'e':
             {
