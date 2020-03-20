@@ -100,7 +100,7 @@ struct tcpspammer_ctx
   unsigned int n_destinations;           //!< Number of destinations.
   unsigned int n_connections;            //!< Number of connections per thread.
   unsigned int n_connections_per_sec;    //!< Number of connections per second.
-  _Atomic short n_finished;              //!< Number of threads finished.
+  _Atomic unsigned short n_finished;     //!< Number of threads finished.
   _Atomic uint64_t new_connections;      //!< New connections this second.
   bool listen; //!< True if process listens rather than connects.
   bool disconnect_after_hello; //!< True if connection is closed after reply.
@@ -210,13 +210,13 @@ static int init_timer(struct timespec tv)
         }
       else
         {
-          ERR("Failed to set timer %d: %m", fd);
+          FATAL("Failed to set timer %d: %m", fd);
         }
       safe_close(&fd);
     }
   else
     {
-      ERR("Failed to create timerfd: %m");
+      FATAL("Failed to create timerfd: %m");
     }
   return fd;
 }
@@ -265,12 +265,12 @@ static bool max_nofile_soft(void)
         }
       else
         {
-          ERR("Failed to increase soft limit to %lu: %m", limits.rlim_cur);
+          FATAL("Failed to increase soft limit to %lu: %m", limits.rlim_cur);
         }
     }
   else
     {
-      ERR("Failed to get soft limits: %m");
+      FATAL("Failed to get soft limits: %m");
     }
   return false;
 }
@@ -300,13 +300,13 @@ static bool max_nofile(void)
             }
           else
             {
-              ERR("Failed to read %s: %m", files[i]);
+              FATAL("Failed to read %s: %m", files[i]);
             }
           fclose(fp);
         }
       else
         {
-          ERR("Failed to open %s: %m", files[i]);
+          FATAL("Failed to open %s: %m", files[i]);
         }
     }
 
@@ -319,7 +319,7 @@ static bool max_nofile(void)
     }
   else
     {
-      ERR("Failed to increase hard limit to %lu: %m", limits.rlim_cur);
+      FATAL("Failed to increase hard limit to %lu: %m", limits.rlim_cur);
     }
   return false;
 }
@@ -372,7 +372,7 @@ static unsigned int address_to_range(const char *str,
 
       // Yeah yeah no null termination goes bad.
       strncpy(start, str, limiter - str);
-      strncpy(end, limiter + 1, strlen(limiter + 1));
+      strncpy(end, limiter + 1, sizeof(end) - 1);
 
       INF("Using %s from %s to %s", (source) ? "sources" : "destinations",
           start, end);
@@ -1171,12 +1171,12 @@ static bool init_threads(struct tcpspammer_ctx *ctx, const char *sources,
                 }
               else
                 {
-                  ERR("Failed to start thread %u: %m", i);
+                  FATAL("Failed to start thread %u: %m", i);
                 }
             }
           else
             {
-              ERR("Failed to set affinity for thread %d: %m", i);
+              FATAL("Failed to set affinity for thread %d: %m", i);
             }
         }
       return true;
@@ -1227,7 +1227,7 @@ static bool init_efds(struct tcpspammer_ctx *ctx)
     }
   else
     {
-      ERR("Failed to create efd: %m");
+      FATAL("Failed to create efd: %m");
     }
   return false;
 }
@@ -1292,7 +1292,11 @@ static bool handle_logpipe(__attribute__((unused)) struct tcpspammer_ctx *ctx)
 
   while ((len = read(logpipe[0], buf, sizeof(buf))) > 0 && --max_iter)
     {
-      write(STDOUT_FILENO, buf, len);
+      if (write(STDOUT_FILENO, buf, len) == -1 &&
+          (errno == EBADF || errno == EINVAL || errno == EPIPE))
+        {
+          return false;
+        }
     }
   if (!max_iter)
     {
@@ -1449,7 +1453,8 @@ int main(int argc, char **argv)
           max_conns_per_loop = atoi(optarg);
           break;
         default:
-          ERR("Unknown arg %c", c);
+          FATAL("Unknown arg %c", c);
+          /* fall through */
         case 'h':
           exit_val = EXIT_FAILURE;
           usage(argv[0]);
@@ -1470,24 +1475,24 @@ int main(int argc, char **argv)
     }
   else if (!ctx.listen && !destinations)
     {
-      ERR("No destinations set for connections");
+      FATAL("No destinations set for connections");
       usage(argv[0]);
     }
   else if (ctx.eventfd == -1)
     {
-      ERR("Failed to create eventfd: %m");
+      FATAL("Failed to create eventfd: %m");
     }
   else if ((ctx.timerfd = init_timer((struct timespec){1,0})) == -1)
     {
-      ERR ("Failed to init timer");
+      FATAL("Failed to init timer");
     }
   else if (!init_efds(&ctx))
     {
-      ERR ("Failed to init main efds");
+      FATAL("Failed to init main efds");
     }
   else if (!init_threads(&ctx, sources, destinations, service, port))
     {
-      ERR("Failed to initialize threads");
+      FATAL("Failed to initialize threads");
     }
   else
     {
