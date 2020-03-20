@@ -7,7 +7,6 @@
 #include <string.h>
 #include <stdio.h>
 #include <sched.h>
-#include <unistd.h>
 #include <fcntl.h>
 #include <stdbool.h>
 #include <pthread.h>

@@ -14,7 +14,7 @@ Add some bogus IPv6 addresses to loopback for testing:
 Now start tcpspammer listening on those addresses:
 
 ```
-# ./tcpspammer -l -s fd99::a-fd99::28 -L 5000 -w -M -n 3
+# ./tcpspammer -l -s fd99::a-fd99::28 -L 5000 -w -m -n 3
 Active: 0, Established: 0
 Active: 0, Established: 0
 Active: 0, Established: 0
@@ -27,7 +27,7 @@ connection count to 3, meaning 3\*12 listeners are active.
 Lets start the client-side:
 
 ```
-./tcpspammer  -s fd99::64-fd99::8c -d fd99::a-fd99::28 -p 5000 -M -w -n 40000
+./tcpspammer  -s fd99::64-fd99::8c -d fd99::a-fd99::28 -p 5000 -m -w -n 40000
 Active: 136478, Established: 0
 Active: 206988, Established: 0
 ```
